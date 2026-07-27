@@ -671,15 +671,15 @@ std::wstring createVirtualDisplay(
 		return std::wstring();
 	}
 
-	uint32_t retryInterval = 20;
+	const ULONGLONG deadline = GetTickCount64() + 10000;
 	wchar_t deviceName[CCHDEVICENAME]{};
 	while (!GetAddedDisplayName(output, deviceName)) {
-		Sleep(retryInterval);
-		if (retryInterval > 320) {
+		if (GetTickCount64() >= deadline) {
 			printf("[SUDOVDA] Cannot get name for newly added virtual display!\n");
 			return std::wstring();
 		}
-		retryInterval *= 2;
+
+		Sleep(100);
 	}
 
 	wprintf(L"[SUDOVDA] Virtual display added successfully: %ls\n", deviceName);
