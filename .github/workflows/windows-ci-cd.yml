@@ -1,0 +1,271 @@
+name: Windows CI/CD
+
+on:
+  pull_request:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/windows-ci-cd.yml"
+      - ".gitmodules"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "package.json"
+      - "packaging/**"
+      - "src/**"
+      - "src_assets/**"
+      - "third-party/**"
+      - "tools/**"
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+    paths:
+      - ".github/workflows/windows-ci-cd.yml"
+      - ".gitmodules"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "package.json"
+      - "packaging/**"
+      - "src/**"
+      - "src_assets/**"
+      - "third-party/**"
+      - "tools/**"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish, for example v0.4.9"
+        required: true
+        type: string
+      draft:
+        description: "Create the GitHub Release as a draft"
+        required: true
+        default: true
+        type: boolean
+      prerelease:
+        description: "Mark the GitHub Release as a pre-release"
+        required: true
+        default: false
+        type: boolean
+      create_release:
+        description: "Create or update the GitHub Release after building"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-cd-${{ github.event_name }}-${{ github.ref }}-${{ inputs.release_tag || 'none' }}
+  cancel-in-progress: false
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  windows:
+    name: Build Windows installer
+    runs-on: windows-2022
+    timeout-minutes: 60
+    outputs:
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Resolve build metadata
+        id: metadata
+        shell: pwsh
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $releaseTag = $env:INPUT_RELEASE_TAG.Trim()
+            if ($releaseTag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') {
+              throw "release_tag must be a semantic version beginning with v, for example v0.4.9."
+            }
+
+            $packageVersion = $releaseTag
+            $artifactSuffix = $releaseTag
+          } elseif ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $releaseTag = $env:GITHUB_REF_NAME
+            if ($releaseTag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') {
+              throw "Release tags must be semantic versions beginning with v."
+            }
+
+            $packageVersion = $releaseTag
+            $artifactSuffix = $releaseTag
+          } elseif ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+            $releaseTag = "pr-$env:PR_NUMBER"
+            $packageVersion = "v0.0.$env:GITHUB_RUN_NUMBER"
+            $artifactSuffix = $releaseTag
+          } else {
+            $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+            $releaseTag = "ci-$env:GITHUB_REF_NAME-$shortSha"
+            $packageVersion = "v0.0.$env:GITHUB_RUN_NUMBER"
+            $artifactSuffix = "$env:GITHUB_REF_NAME-$shortSha"
+          }
+
+          $artifactSuffix = $artifactSuffix -replace '[^A-Za-z0-9._-]', '-'
+          $assetVersion = $artifactSuffix -replace '^v', ''
+          $artifactName = "Apollo-$artifactSuffix-windows-installer"
+          $assetName = "Apollo-$assetVersion.exe"
+
+          "artifact_name=$artifactName" >> $env:GITHUB_OUTPUT
+          "asset_name=$assetName" >> $env:GITHUB_OUTPUT
+          "package_version=$packageVersion" >> $env:GITHUB_OUTPUT
+          "release_tag=$releaseTag" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "lts/*"
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
+        with:
+          msystem: UCRT64
+          path-type: inherit
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-cppwinrt
+            mingw-w64-ucrt-x86_64-curl-winssl
+            mingw-w64-ucrt-x86_64-MinHook
+            mingw-w64-ucrt-x86_64-miniupnpc
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-nlohmann-json
+            mingw-w64-ucrt-x86_64-nsis
+            mingw-w64-ucrt-x86_64-onevpl
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-opus
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-toolchain
+
+      - name: Verify toolchain
+        shell: msys2 {0}
+        run: |
+          cmake --version
+          ninja --version
+          npm --version
+
+      - name: Configure
+        shell: msys2 {0}
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          BUILD_VERSION: ${{ steps.metadata.outputs.package_version }}
+          CLONE_URL: ${{ github.server_url }}/${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+          TAG: ${{ steps.metadata.outputs.release_tag }}
+        run: |
+          cmake -B build -G Ninja -S . -DCMAKE_BUILD_TYPE="${BUILD_TYPE}"
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          cmake --build build --config "${BUILD_TYPE}"
+
+      - name: Package installer
+        shell: msys2 {0}
+        run: |
+          cpack -G NSIS --config ./build/CPackConfig.cmake
+
+      - name: Collect installer and checksum
+        shell: pwsh
+        env:
+          ASSET_NAME: ${{ steps.metadata.outputs.asset_name }}
+        run: |
+          $installer = Join-Path $PWD 'build/cpack_artifacts/Apollo.exe'
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "No NSIS installer was produced at $installer."
+          }
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $assetPath = Join-Path $PWD "dist/$env:ASSET_NAME"
+          Copy-Item -LiteralPath $installer -Destination $assetPath -Force
+
+          $hash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $env:ASSET_NAME" | Set-Content -LiteralPath "$assetPath.sha256" -Encoding ascii
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.create_release)
+    needs:
+      - windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download installer artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.windows.outputs.artifact_name }}
+          path: dist
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.windows.outputs.release_tag }}
+          DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || contains(needs.windows.outputs.release_tag, '-') }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*)
+
+          if (( ${#assets[@]} == 0 )); then
+            echo "No release assets were downloaded." >&2
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$RELEASE_TAG" \
+              --draft="$DRAFT" \
+              --prerelease="$PRERELEASE"
+            gh release upload "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            create_args=(
+              release create "$RELEASE_TAG"
+              "${assets[@]}"
+              --repo "$GITHUB_REPOSITORY"
+              --title "$RELEASE_TAG"
+              --target "$GITHUB_SHA"
+              --generate-notes
+            )
+
+            if [[ "$DRAFT" == "true" ]]; then
+              create_args+=(--draft)
+            fi
+
+            if [[ "$PRERELEASE" == "true" ]]; then
+              create_args+=(--prerelease)
+            fi
+
+            gh "${create_args[@]}"
+          fi
